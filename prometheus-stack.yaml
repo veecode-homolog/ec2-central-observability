@@ -1,0 +1,102 @@
+alertmanager:
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          resources:
+            requests:
+              storage: 10Gi
+  enabled: true
+  ingress:
+    annotations:
+      kubernetes.io/tls-acme: "true"
+    enabled: true
+    hosts:
+    - alertmanager.vkpr.platform.vee.codes
+    ingressClassName: kong
+    pathType: ImplementationSpecific
+    tls:
+    - hosts:
+      - alertmanager.vkpr.platform.vee.codes
+commonLabels:
+  app.kubernetes.io/managed-by: vkpr
+grafana:
+  additionalDataSources:
+  - name: Jaeger
+    type: jaeger
+    url: http://jaeger-all-in-one.vkpr:16686  
+  - access: proxy
+    basicAuth: false
+    editable: true
+    name: Loki
+    type: loki
+    url: http://loki.vkpr:3100
+  adminPassword: vkpr123
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+      - folder: ""
+        name: homepage
+        options:
+          path: /var/lib/grafana/dashboards/homepage
+        orgId: 1
+        type: file
+  dashboardsConfigMaps:
+    homepage: homepage
+  enabled: true
+  env:
+    GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/homepage/homepage.json
+  ingress:
+    annotations:
+      kubernetes.io/tls-acme: "true"
+    enabled: true
+    hosts:
+    - grafana.vkpr.platform.vee.codes
+    ingressClassName: kong
+    path: /
+    tls:
+    - hosts:
+      - grafana.vkpr.platform.vee.codes
+  persistence:
+    enabled: true
+    size: 10Gi
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: vkpr
+      searchNamespace: ALL
+    datasources:
+      uid: prometheus
+      url: http://prometheus-stack-kube-prom-prometheus.vkpr:9090
+prometheus:
+  enabled: true
+  ingress:
+    annotations:
+      kubernetes.io/tls-acme: "true"
+    enabled: true
+    hosts:
+    - prometheus.vkpr.platform.vee.codes
+    ingressClassName: kong
+    tls:
+    - hosts:
+      - prometheus.vkpr.platform.vee.codes
+  prometheusSpec:
+    enableRemoteWriteReceiver: true
+    externalLabels:
+      cluster: ec2-central-observability
+    remoteWrite:
+    - name: remote
+      url: /api/v1/write
+    retention: 1d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+          - ReadWriteOnce
+          resources:
+            requests:
+              storage: 10Gi
+prometheusOperator:
+  enabled: true

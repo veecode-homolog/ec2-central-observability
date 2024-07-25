@@ -1,0 +1,28 @@
+environment: platform_homolog_environment
+### Project Settings
+componentId: ec2-central-observability
+cluster_name: ec2-central-observability
+owner: group:default/admin
+instance_type: m5.large
+volume_size: 30
+keypair_name: platform_kp
+### Network Settings
+vpc_id: vpc-051721395ecf1f7aa
+domain: vkpr.platform.vee.codes
+hostedZoneId: Z08737613ML5F3HE67WJ3
+subnet_id: subnet-04dda6147dd9410f1
+### Ingress Settings
+ingress_window: true
+basic_auth: true
+issuer_type: staging
+email: platformss@vee.codes
+### Terraform Backend Settings
+terraformStateBucketName: veecode-homolog-terraform-state
+terraformStateBucketRegion: us-east-1
+infracost: true
+### Publish Settings
+host: github.com
+destination: veecode-homolog/ec2-central-observability
+specPublish: ${{ parameters.specPublish | parseRepoUrl | pick('owner') }}/${{ parameters.specPublish | parseRepoUrl | pick('repo') }}
+specPublishRepo: ${{ parameters.specPublish | parseRepoUrl | pick('repo') }}
+specPublishBranch: 

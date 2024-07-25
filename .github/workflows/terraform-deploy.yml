@@ -1,0 +1,276 @@
+name: Create
+
+on:
+  workflow_dispatch:
+env:
+  PORT: 6550
+  USERNAME: ec2-user
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: hashicorp/setup-terraform@v2
+      - uses: actions/cache@v3
+        with:
+          path: |
+            .terraform/**
+            .terraform.lock.hcl
+            plan.cache
+          key: terraform-lock-${{ github.head_ref || github.ref_name }}
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          
+      - name: Terraform plan
+        run: |
+          terraform init
+          terraform plan -no-color -out plan_cache.json 
+
+      - name: Terraform apply
+        run: |
+          terraform apply -input=false -no-color -auto-approve plan_cache.json
+
+  kubeconfig:
+    runs-on: ubuntu-latest
+    needs: apply
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v3
+      - uses: hashicorp/setup-terraform@v2
+      - name: Write secret to file
+        run: |
+          echo "${{ secrets.KEYPAIR }}" > cert.pem
+          chmod 600 cert.pem
+          
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Waiting for cluster to be ready
+        run: |
+          HOST=`aws ec2 describe-instances --filters 'Name=tag:Name,Values=ec2-central-observability'   --output text --query 'Reservations[*].Instances[*].PublicIpAddress'`
+          while ! nc -z $HOST $PORT; do
+            echo "waiting for cluster to be ready..."
+            sleep 2
+          done
+          echo "Cluster Ready!"
+          echo "Host=$HOST" >> $GITHUB_ENV
+
+      - name: Generate kube config with k3d
+        run: |
+           ssh -i ./cert.pem -o StrictHostKeyChecking=no $USERNAME@${{  env.Host }} "k3d kubeconfig get k3s > config"
+ 
+      - name: Download kube config
+        run: |
+           mkdir -p ~/.kube
+           scp -i ./cert.pem -o StrictHostKeyChecking=no $USERNAME@${{ env.Host }}:config ~/.kube/config
+ 
+      - name: Print downloaded config
+        run: |  
+          CERTIFICATE=`cat  ~/.kube/config |grep certificate-authority-data `
+          sed -i "s|$CERTIFICATE|    insecure-skip-tls-verify: true|g" ~/.kube/config
+          sed -i "s|0.0.0.0|${{ env.Host }}|g" ~/.kube/config
+ 
+      - name: Upload kube config
+        uses: actions/upload-artifact@v3
+        with:
+          name: kube-config
+          path: ~/.kube/config
+
+      - name: Write Catalogo Info
+        run: |
+          yq e '.metadata.environment.public_ip = "${{ env.Host }}"' -i .platform/component.yaml
+          yq -e '.metadata.annotations["cluster/instructions"] = "# Run the following commands to import the kubeconfig:
+            ssh -i ./cert.pem -o StrictHostKeyChecking=no $USERNAME@$${{ env.Host }} \"mkdir -p .kube && k3d kubeconfig get k3s > ~/.kube/config\"
+            scp -i ./cert.pem $USERNAME@$${{ env.Host }}:~/.kube/config ~/.kube/config-ec2-central-observability
+            yq -e '\''del(.clusters[0].cluster.certificate-authority-data) | .clusters[0].cluster.insecure-skip-tls-verify=true | .clusters[].cluster.server |= sub(\"0.0.0.0\", \"${{ env.Host }}\")'\'' -i ~/.kube/config-ec2-central-observability
+            export KUBECONFIG=~/.kube/config-ec2-central-observability
+            kubectl get pods -A
+          "' -i .platform/component.yaml
+          cat ./.platform/component.yaml
+
+      - name: Temporarily disable branch protection
+        uses: benjefferies/branch-protection-bot@master
+        if: always()
+        with:
+          access_token: ${{ secrets.API_TOKEN_GITHUB }}
+          branch: ${{ github.event.repository.default_branch }}
+
+      - name: Publish catalog info
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          repository: ".platform/"
+          commit_user_name: veecode-bot
+          commit_user_email: github-admin@vee.codes
+          commit_author: veecode-bot<github-admin@vee.codes>
+          commit_message: "Update catalog-info.yaml with cluster endpoint"
+          push_options: '--force'
+          
+  ingress-apply:
+    runs-on: ubuntu-latest
+    needs: kubeconfig
+    steps:
+      - uses: actions/checkout@v3
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+        
+    ### Usin k8s context
+      - name: Download kubeconfig artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: kube-config
+          path: ~/.kube
+
+      - name: Install Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
+
+      - name: Add Postgresql Helm repository
+        run: |
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo update
+    
+      - name: Install Postgresql
+        run: |
+          helm upgrade --install postgresql bitnami/postgresql --version 15.5.17 -f postgres.yaml -n vkpr --create-namespace
+        
+      - name: Add Kong Helm repository
+        run: |
+          helm repo add kong https://charts.konghq.com
+          helm repo update
+  
+      - name: Install Kong
+        run: |
+          helm upgrade --install kong kong/kong --version 2.39.3 -f kong.yaml -n vkpr --create-namespace
+
+      - name: Apply Kong Plugins
+        run: |
+            kubectl apply -f kong-acme.yaml -n vkpr
+            kubectl apply -f kong-plugin-basicauth.yaml -n vkpr
+            kubectl apply -f kong-plugin-prometheus.yaml -n vkpr    
+            kubectl apply -f kong-plugin-otlp.yaml -n vkpr  
+
+  observability-apply:
+    runs-on: ubuntu-latest
+    needs: kubeconfig
+    steps:
+      - uses: actions/checkout@v3
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY}}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY}}
+          aws-region: ${{ secrets.AWS_REGION}}
+ 
+    ### Usin k8s context
+      - name: Download kubeconfig artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: kube-config
+          path: ~/.kube
+
+      - name: Install Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
+
+      - name: Add Jaeger Helm repository
+        run: |
+          helm repo add jaeger-all-in-one https://raw.githubusercontent.com/hansehe/jaeger-all-in-one/master/helm/charts
+          helm repo update
+
+      - name: Install Jaeger All in One
+        run: |
+          helm upgrade --install jaeger-all-in-one jaeger-all-in-one/jaeger-all-in-one --wait --version 0.1.12 -n vkpr --create-namespace \
+            --set enableHttpOpenTelemetryCollector=true
+          kubectl apply -f jaeger-service-nodeport-all-in-one.yaml -n vkpr
+
+      - name: Add OpenTelemetry Helm repository
+        run: |
+          helm repo add opentelemetry-helm https://open-telemetry.github.io/opentelemetry-helm-charts
+          helm repo update
+  
+      - name: Install OpenTelemetry Collector
+        run: |
+          helm upgrade --install opentelemetry-operator opentelemetry-helm/opentelemetry-operator --wait --version 0.63.1 -n vkpr --create-namespace \
+            --set manager.collectorImage.repository=otel/opentelemetry-collector-k8s \
+            --set admissionWebhooks.certManager.enabled=false \
+            --set admissionWebhooks.autoGenerateCert.enabled=true           
+
+      - name: Apply OpenTelemetry Collector configuration
+        run: |
+          sleep 5
+          kubectl apply -f - <<EOF
+          apiVersion: opentelemetry.io/v1beta1
+          kind: OpenTelemetryCollector
+          metadata:
+            name: otel
+            namespace: vkpr
+          spec:
+            config:
+              receivers:
+                otlp:
+                  protocols:
+                    grpc:
+                      endpoint: 0.0.0.0:4317
+                    http:
+                      endpoint: 0.0.0.0:4318
+              processors:
+                memory_limiter:
+                  check_interval: 1s
+                  limit_percentage: 75
+                  spike_limit_percentage: 15
+                batch:
+                  send_batch_size: 10000
+                  timeout: 10s
+              exporters:
+                otlp:
+                  endpoint: jaeger-all-in-one.vkpr:4317
+                  tls:
+                    insecure: true
+              service:
+                pipelines:
+                  traces:
+                    receivers: [otlp]
+                    processors: [memory_limiter, batch]
+                    exporters: [otlp]
+          EOF
+
+      - name: Apply OpenTelemetry auto-instrumentation
+        run: |
+          sleep 5        
+          kubectl apply -f instrumentation.yaml -n vkpr            
+
+      - name: Add Loki Helm repository
+        run: |
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+
+      - name: Install Loki 
+        run: |
+          helm upgrade --install loki grafana/loki-stack --version 2.9.11 -f loki.yaml -n vkpr --create-namespace
+          kubectl apply -f loki-nodeport-service.yaml -n vkpr
+
+      - name: Add Prometheus-stack Helm repository
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+      - name: Install Prometheus-stack 
+        run: |
+          kubectl apply -f homepage.yaml -n vkpr
+          helm upgrade --install prometheus-stack prometheus-community/kube-prometheus-stack --version 55.5.0 -n vkpr -f prometheus-stack.yaml --create-namespace          
+          kubectl apply -f prometheus-nodeport-service.yaml -n vkpr

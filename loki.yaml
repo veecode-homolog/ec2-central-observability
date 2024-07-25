@@ -1,0 +1,6 @@
+loki:
+  enabled: true
+  isDefault: false
+  url: http://loki.vkpr:3100
+promtail:
+  enabled: true
